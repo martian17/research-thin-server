@@ -1,0 +1,11 @@
+# the volume is specific to my deployment environment. If you're using this personally you should probably modify this. 
+services:
+  research-thin-server-service:
+    image: research-thin-server:latest
+    container_name: research-thin-server-container
+    ports:
+      # Format: "HOST_PORT:CONTAINER_PORT"
+      - "8081:8080"
+    volumes:
+      - /mnt/research:/app/content
+    restart: unless-stopped

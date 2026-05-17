@@ -24,7 +24,7 @@ async fn main() {
         .fallback_service(static_service);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    println!("Martian Research Hub running on http://localhost:8080");
+    println!("Martian Research Hub running on http://0.0.0.0:8080");
     axum::serve(listener, app).await.unwrap();
 }
 
