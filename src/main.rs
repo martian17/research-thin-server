@@ -19,7 +19,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(serve_index))
-        // This handler now decides: is it a Markdown page or a static asset?
+        // This handler now decides: is it a directory, a Markdown page, or a static asset?
         .route("/{*path}", get(handle_request))
         .fallback_service(static_service);
 
@@ -28,23 +28,64 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn serve_index() -> impl IntoResponse {
-    render_markdown("index".to_string()).await
+async fn serve_index(req: Request<Body>) -> Response {
+    handle_path(String::new(), req).await
 }
 
 async fn handle_request(AxPath(path): AxPath<String>, req: Request<Body>) -> Response {
+    handle_path(path, req).await
+}
+
+/// Unified path handler to manage directories, static assets, and markdown files
+async fn handle_path(path: String, req: Request<Body>) -> Response {
+    let full_path = PathBuf::from("./content").join(&path);
+
+    // 1. If the path is a directory, handle index checks and auto-generation
+    if full_path.is_dir() {
+        // Enforce a trailing slash for directory URLs so relative links work reliably
+        if !path.is_empty() && !path.ends_with('/') {
+            return Response::builder()
+                .status(StatusCode::MOVED_PERMANENTLY)
+                .header(header::LOCATION, format!("/{}/", path))
+                .body(Body::empty())
+                .unwrap();
+        }
+
+        // If index.html exists, let ServeDir handle it
+        if full_path.join("index.html").exists() {
+            match ServeDir::new("./content").oneshot(req).await {
+                Ok(res) => return res.into_response(),
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+
+        // If index.md exists instead, render it as the directory's homepage
+        if full_path.join("index.md").exists() {
+            let index_md_target = if path.is_empty() {
+                "index".to_string()
+            } else {
+                format!("{}index", path)
+            };
+            return render_markdown(index_md_target).await.into_response();
+        }
+
+        // Auto-generate a directory index page if no index file exists
+        return match generate_directory_index(&path, &full_path) {
+            Ok(html_content) => Html(html_content).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
+
+    // 2. If it has an extension (e.g., .pdf, .js, .webp), treat it as a static file
     let path_buf = PathBuf::from(&path);
-    
-    // 1. If it has an extension (e.g., .pdf, .js, .webp), treat it as a static file
     if path_buf.extension().is_some() {
-        // We manually call ServeDir for this specific path
         match ServeDir::new("./content").oneshot(req).await {
             Ok(res) => return res.into_response(),
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     }
 
-    // 2. If no extension, try to render it as a Markdown file
+    // 3. If no extension and not a directory, try to render it as a Markdown file
     render_markdown(path).await.into_response()
 }
 
@@ -54,22 +95,73 @@ async fn render_markdown(name: String) -> impl IntoResponse {
 
     match fs::read_to_string(path) {
         Ok(markdown_input) => {
-            let mut options = Options::empty();
-            options.insert(Options::ENABLE_TABLES);
-            options.insert(Options::ENABLE_FOOTNOTES);
-            options.insert(Options::ENABLE_STRIKETHROUGH);
-            options.insert(Options::ENABLE_TASKLISTS);
-            // gemini inserted this but doesn't work
-            // options.insert(Options::ENABLE_MATHJAX); // Bonus: for your LaTeX formulas!
-
-            let parser = Parser::new_ext(&markdown_input, options);
-            let mut html_output = String::new();
-            html::push_html(&mut html_output, parser);
-
+            let html_output = markdown_to_html(&markdown_input);
             Html(wrap_in_template(&html_output)).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// Dynamically builds a clean Markdown directory listing and compiles it to HTML
+fn generate_directory_index(display_path: &str, full_path: &std::path::Path) -> Result<String, std::io::Error> {
+    let title_path = if display_path.is_empty() { "/" } else { display_path };
+    let mut markdown_input = format!("# Index of `{}`\n\n", title_path);
+
+    // Provide a back/up link if we're inside a subdirectory
+    if !display_path.is_empty() {
+        markdown_input.push_str("* [📁 ..](../)\n");
+    }
+
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(full_path)? {
+        let entry = entry?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+
+        // Ignore hidden files and directories
+        if file_name.starts_with('.') {
+            continue;
+        }
+
+        let file_type = entry.file_type()?;
+        entries.push((file_name, file_type.is_dir()));
+    }
+
+    // Sort entries: directories first, followed by files alphabetically
+    entries.sort_by(|a, b| {
+        if a.1 != b.1 {
+            b.1.cmp(&a.1) 
+        } else {
+            a.0.cmp(&b.0)
+        }
+    });
+
+    for (name, is_dir) in entries {
+        if is_dir {
+            markdown_input.push_str(&format!("* [📁 {}/](./{}/)\n", name, name));
+        } else if name.ends_with(".md") {
+            // Strip the extension for markdown files so clicking them triggers the HTML renderer
+            let base_name = &name[..name.len() - 3];
+            markdown_input.push_str(&format!("* [📄 {}](./{})\n", base_name, base_name));
+        } else {
+            markdown_input.push_str(&format!("* [📄 {}](./{})\n", name, name));
+        }
+    }
+
+    let html_output = markdown_to_html(&markdown_input);
+    Ok(wrap_in_template(&html_output))
+}
+
+fn markdown_to_html(markdown_input: &str) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let parser = Parser::new_ext(markdown_input, options);
+    let mut html_output = String::new();
+    html::push_html(&mut html_output, parser);
+    html_output
 }
 
 fn wrap_in_template(content: &str) -> String {
